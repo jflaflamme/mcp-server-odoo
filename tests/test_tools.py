@@ -1,5 +1,6 @@
 """Test suite for MCP tools functionality."""
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -2590,6 +2591,58 @@ class TestParseDomainInput:
         with pytest.raises(ValidationError) as exc_info:
             handler._parse_domain_input('{"key": "value"}')
         assert "Domain must be a list, got dict" in str(exc_info.value)
+
+
+class TestToolSchemaTypes:
+    """Published tool schemas must be typed, never free-form.
+
+    A parameter annotated ``Any`` serializes to an empty JSON Schema (``{}``),
+    which means "anything". Clients that constrain generation from the schema
+    (llama.cpp compiles tool schemas to a GBNF grammar) treat a constraint-free
+    schema as a free-form *object*, so the model becomes unable to emit ``[``
+    for that parameter -- it sends ``{"search": "[[...]]"}`` instead of a domain
+    and retries forever. Keep every published parameter explicitly typed.
+    """
+
+    @pytest.fixture
+    def schemas(self):
+        app = FastMCP("test")
+        connection = MagicMock(spec=OdooConnection)
+        connection.is_authenticated = True
+        config = OdooConfig(url="http://localhost:8069", api_key="k", database="d")
+        OdooToolHandler(app, connection, MagicMock(spec=AccessController), config)
+
+        async def collect():
+            return {t.name: t.inputSchema for t in await app.list_tools()}
+
+        return asyncio.run(collect())
+
+    @staticmethod
+    def _admits_anything(param_schema: dict) -> bool:
+        """True if the schema places no constraint (bare {} or {} inside anyOf)."""
+        if param_schema == {}:
+            return True
+        return any(branch == {} for branch in param_schema.get("anyOf", []))
+
+    def test_no_parameter_is_constraint_free(self, schemas):
+        offenders = [
+            f"{tool}.{param}"
+            for tool, schema in schemas.items()
+            for param, param_schema in schema.get("properties", {}).items()
+            if self._admits_anything(param_schema)
+        ]
+        assert not offenders, f"Untyped (free-form) tool parameters: {offenders}"
+
+    @pytest.mark.parametrize(
+        "tool,param", [("search_records", "domain"), ("aggregate_records", "domain")]
+    )
+    def test_domain_accepts_array_or_string(self, schemas, tool, param):
+        branches = schemas[tool]["properties"][param]["anyOf"]
+        assert {"array", "string", "null"} <= {b.get("type") for b in branches}
+
+    def test_fields_accepts_array_or_string(self, schemas):
+        branches = schemas["search_records"]["properties"]["fields"]["anyOf"]
+        assert {"array", "string", "null"} <= {b.get("type") for b in branches}
 
 
 class TestCallModelMethodTool:

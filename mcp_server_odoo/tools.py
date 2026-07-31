@@ -420,8 +420,12 @@ class OdooToolHandler:
         )
         async def search_records(
             model: str,
-            domain: Optional[Any] = None,
-            fields: Optional[Any] = None,
+            # Explicitly typed rather than Any: Any serializes to an empty JSON
+            # Schema ({}), which grammar-constrained clients read as a free-form
+            # object, leaving the model unable to emit a list here. The runtime
+            # already accepts both forms (see _parse_domain_input).
+            domain: Optional[Union[List[Any], str]] = None,
+            fields: Optional[Union[List[str], str]] = None,
             limit: Optional[int] = None,
             offset: int = 0,
             order: Optional[str] = None,
@@ -692,7 +696,9 @@ class OdooToolHandler:
             model: str,
             groupby: List[str],
             aggregates: Optional[List[str]] = None,
-            domain: Optional[Any] = None,
+            # Explicitly typed, not Any: see search_records (empty schema breaks
+            # grammar-constrained clients).
+            domain: Optional[Union[List[Any], str]] = None,
             order: Optional[str] = None,
             limit: Optional[int] = None,
             offset: int = 0,
