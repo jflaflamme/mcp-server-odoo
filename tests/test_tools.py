@@ -2636,9 +2636,43 @@ class TestToolSchemaTypes:
     @pytest.mark.parametrize(
         "tool,param", [("search_records", "domain"), ("aggregate_records", "domain")]
     )
-    def test_domain_accepts_array_or_string(self, schemas, tool, param):
+    def test_domain_schema_publishes_list_form_only(self, schemas, tool, param):
+        """The schema advertises the list form; the string form stays runtime-only.
+
+        A visible ``string`` branch is an escape hatch a grammar-constrained
+        model will take -- observed emitting ``domain="name ilike 'inno'"`` and
+        burning turns on the rejection. Strings are still accepted at runtime
+        via BeforeValidator (see test_domain_string_still_accepted_at_runtime),
+        so legacy clients keep working; they are just no longer advertised.
+        """
         branches = schemas[tool]["properties"][param]["anyOf"]
-        assert {"array", "string", "null"} <= {b.get("type") for b in branches}
+        types = {b.get("type") for b in branches}
+        assert "array" in types and "null" in types
+        assert "string" not in types
+
+    @pytest.mark.parametrize(
+        "tool,param", [("search_records", "domain"), ("aggregate_records", "domain")]
+    )
+    def test_domain_condition_triplet_is_shaped(self, schemas, tool, param):
+        """Each condition must be a 3-element ["field", "operator", value]."""
+        array_branch = next(
+            b for b in schemas[tool]["properties"][param]["anyOf"] if b.get("type") == "array"
+        )
+        cond = next(
+            b for b in array_branch["items"]["anyOf"] if b.get("type") == "array"
+        )
+        assert cond["minItems"] == 3 and cond["maxItems"] == 3
+        assert [p.get("type") for p in cond["prefixItems"]] == ["string", "string", None]
+
+    def test_domain_string_still_accepted_at_runtime(self):
+        """Legacy stringified-JSON domains keep working despite the hidden branch."""
+        from mcp_server_odoo.tools import _coerce_domain_string
+
+        assert _coerce_domain_string('[["name","ilike","acme"]]') == [["name", "ilike", "acme"]]
+        assert _coerce_domain_string("[['name','ilike','acme']]") == [["name", "ilike", "acme"]]
+        assert _coerce_domain_string([["name", "ilike", "acme"]]) == [["name", "ilike", "acme"]]
+        with pytest.raises(ValueError, match=r'\["field", "operator", value\]'):
+            _coerce_domain_string("name = acme")
 
     def test_fields_accepts_array_or_string(self, schemas):
         branches = schemas["search_records"]["properties"]["fields"]["anyOf"]

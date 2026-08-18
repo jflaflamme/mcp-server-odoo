@@ -12,7 +12,9 @@ import re
 import xmlrpc.client
 from ast import literal_eval as _parse_python_literal
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
+
+from pydantic import BeforeValidator
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
@@ -66,9 +68,33 @@ _MAX_JSON_PARAM_BYTES = 1_000_000
 # were never prevented from making.
 DomainCondition = Tuple[str, str, Any]
 DomainElement = Union[DomainCondition, str]  # str covers "&", "|", "!"
-# The trailing `str` branch keeps the legacy JSON-string form working for
-# clients that send '[["name","ilike","acme"]]'; _parse_domain_input accepts it.
-DomainInput = Optional[Union[List[DomainElement], str]]
+
+
+def _coerce_domain_string(value: Any) -> Any:
+    """Accept the legacy '[["name","ilike","acme"]]' string form at runtime.
+
+    Kept as a BeforeValidator rather than a `str` branch in the annotation so
+    the published JSON Schema advertises ONLY the list form. A visible string
+    branch is an escape hatch a weak model will take — it emitted
+    domain="name ilike 'inno'" and burned turns on the rejection — while the
+    clients that legitimately send stringified JSON still work here.
+    """
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            try:
+                return _parse_python_literal(value)
+            except (ValueError, SyntaxError):
+                raise ValueError(
+                    f"Invalid domain parameter. Expected a list of "
+                    f'["field", "operator", value] conditions, e.g. {_DOMAIN_EXAMPLE} — '
+                    f"got: {value[:100]}"
+                ) from None
+    return value
+
+
+DomainInput = Annotated[Optional[List[DomainElement]], BeforeValidator(_coerce_domain_string)]
 
 # Shown in error messages: small models copy a concrete example, they cannot
 # infer one from a type name.
@@ -473,6 +499,12 @@ class OdooToolHandler:
                     - A list: [['is_company', '=', True]]
                     - A JSON string: "[['is_company', '=', true]]"
                     - None: returns all records (default)
+                    Operators: use 'ilike' for case-insensitive substring
+                    match - Odoo adds the wildcards itself, so write
+                    ['name', 'ilike', 'acme'] and NEVER '%acme%'. 'like' is
+                    case-sensitive and matches the literal string. Conditions
+                    are ANDed by default; for OR put '|' BEFORE the two it
+                    joins: ['|', ['name', 'ilike', 'a'], ['ref', '=', 'b']].
                 fields: Field selection options - can be:
                     - None (default): Returns smart selection of common fields
                     - A list: ["field1", "field2", ...] - Returns only specified fields
@@ -762,6 +794,9 @@ class OdooToolHandler:
                     group carries a count. Pass ``["__count", "amount_total:sum"]``
                     to get both.
                 domain: Odoo domain filter — list, JSON string, or None.
+                    Use 'ilike' for case-insensitive substring match
+                    (no '%' wildcards — Odoo adds them). OR is written
+                    as '|' BEFORE the two conditions it joins.
                 order: Sort expression over groupby keys / aggregates,
                     e.g. ``"date_order:month"`` or ``"amount_total:sum desc"``.
                 limit: Maximum number of groups. Defaults to
