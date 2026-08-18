@@ -12,7 +12,7 @@ import re
 import xmlrpc.client
 from ast import literal_eval as _parse_python_literal
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
@@ -52,6 +52,27 @@ _PUBLIC_METHOD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 # Refuse JSON strings larger than this on the parse path — bounds memory and
 # guards against pathological inputs.
 _MAX_JSON_PARAM_BYTES = 1_000_000
+
+# --- Domain typing -----------------------------------------------------------
+# An Odoo domain is a flat list mixing condition triplets with logical operator
+# strings, e.g. ["|", ["name", "ilike", "acme"], ["is_company", "=", True]].
+#
+# Why the explicit Tuple: a bare List[Any] serializes to {"items": {}} — a
+# free-form JSON Schema. Clients that constrain generation with a grammar
+# (llama.cpp and friends, i.e. every local model) then get NO structural signal
+# and happily emit `domain="name = acme"`, which only fails server-side. Typing
+# the triplet emits prefixItems, so the malformed call becomes unrepresentable
+# rather than merely wrong. Small models cannot recover from a type error they
+# were never prevented from making.
+DomainCondition = Tuple[str, str, Any]
+DomainElement = Union[DomainCondition, str]  # str covers "&", "|", "!"
+# The trailing `str` branch keeps the legacy JSON-string form working for
+# clients that send '[["name","ilike","acme"]]'; _parse_domain_input accepts it.
+DomainInput = Optional[Union[List[DomainElement], str]]
+
+# Shown in error messages: small models copy a concrete example, they cannot
+# infer one from a type name.
+_DOMAIN_EXAMPLE = '[["name", "ilike", "acme"]]'
 
 
 def _json_safe(value: Any) -> Any:
@@ -359,8 +380,17 @@ class OdooToolHandler:
         if domain is None:
             return []
         if not isinstance(domain, str):
-            if not isinstance(domain, list):
-                raise ValidationError(f"Domain must be a list, got {type(domain).__name__}")
+            if not isinstance(domain, (list, tuple)):
+                raise ValidationError(
+                    f"Domain must be a list, got {type(domain).__name__}. "
+                    f"Example: {_DOMAIN_EXAMPLE}"
+                )
+            # Pydantic coerces the typed triplets to tuples; Odoo domains are
+            # conventionally lists, so normalize before they reach XML-RPC.
+            # Rebuild only when needed, so a plain list keeps passing through
+            # untouched (identity preserved for callers that rely on it).
+            if isinstance(domain, tuple) or any(isinstance(el, tuple) for el in domain):
+                return [list(el) if isinstance(el, tuple) else el for el in domain]
             return domain
 
         try:
@@ -372,12 +402,16 @@ class OdooToolHandler:
                 parsed = _parse_python_literal(domain)
             except (ValueError, SyntaxError):
                 raise ValidationError(
-                    f"Invalid domain parameter. Expected JSON array or Python list, "
-                    f"got: {domain[:100]}..."
+                    f"Invalid domain parameter. Expected a list of "
+                    f'["field", "operator", value] conditions, e.g. {_DOMAIN_EXAMPLE} — '
+                    f"got: {domain[:100]}"
                 ) from e
 
         if not isinstance(parsed, list):
-            raise ValidationError(f"Domain must be a list, got {type(parsed).__name__}")
+            raise ValidationError(
+                f"Domain must be a list, got {type(parsed).__name__}. "
+                f"Example: {_DOMAIN_EXAMPLE}"
+            )
 
         logger.debug(f"Parsed domain from string: {parsed}")
         return parsed
@@ -424,7 +458,7 @@ class OdooToolHandler:
             # Schema ({}), which grammar-constrained clients read as a free-form
             # object, leaving the model unable to emit a list here. The runtime
             # already accepts both forms (see _parse_domain_input).
-            domain: Optional[Union[List[Any], str]] = None,
+            domain: DomainInput = None,
             fields: Optional[Union[List[str], str]] = None,
             limit: Optional[int] = None,
             offset: int = 0,
@@ -698,7 +732,7 @@ class OdooToolHandler:
             aggregates: Optional[List[str]] = None,
             # Explicitly typed, not Any: see search_records (empty schema breaks
             # grammar-constrained clients).
-            domain: Optional[Union[List[Any], str]] = None,
+            domain: DomainInput = None,
             order: Optional[str] = None,
             limit: Optional[int] = None,
             offset: int = 0,
